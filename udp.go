@@ -20,22 +20,31 @@
 //
 // Security posture (all cell-supplied addresses are end-user-influenced):
 //
-//	udp_send  is default-deny-private — destinations in loopback /
-//	          link-local / metadata / RFC-1918 / ULA / multicast ranges are
-//	          refused (return code 12) so a cell cannot reach internal
-//	          services or use the host as a reflection/amplification source.
-//	udp_listen is default loopback-only — binding 0.0.0.0 / :: / a public
-//	          interface is refused (return code 12) so a cell cannot expose
-//	          an inbound listener on every interface.
+//	udp_send  refuses destinations in loopback / link-local / metadata /
+//	          multicast ranges (return code 12) so a cell cannot reach the
+//	          host's own services or use the host as a reflection/amplification
+//	          source. RFC-1918 / ULA private ranges are permitted by default
+//	          (UDP_SEND_ALLOW) so a relay can forward to internal game-server
+//	          backends; clear/override UDP_SEND_ALLOW to re-block them.
+//	udp_listen refuses a FIXED-port bind on 0.0.0.0 / :: / a public interface
+//	          unless allowlisted (return code 12) so a cell cannot silently
+//	          expose a stable inbound listener. Loopback and kernel-assigned
+//	          ephemeral (port-0) binds are always allowed; the relay's public
+//	          inbound port is admitted via the default UDP_BIND_ALLOW.
 //	Both    are capped per-cell and globally on concurrent sockets to bound
 //	        host FD / memory / goroutine growth (return code 4 over the cap).
 //
 // Env configuration:
 //
 //	UDP_SEND_ALLOW            comma-separated host[:port] / CIDR send exemptions
+//	                          (default: RFC-1918 / ULA private ranges, so a
+//	                          relay can forward to internal game-server
+//	                          backends; set explicitly to tighten)
 //	UDP_BIND_ALLOW            comma-separated host[:port] / CIDR bind exemptions
-//	UDP_MAX_SOCKETS_PER_CELL  per-cell socket cap (default 64)
-//	UDP_MAX_SOCKETS_TOTAL     global socket cap (default 512)
+//	                          (default: 0.0.0.0,:: so a relay can bind its
+//	                          public inbound listener; set explicitly to tighten)
+//	UDP_MAX_SOCKETS_PER_CELL  per-cell socket cap (default 1024)
+//	UDP_MAX_SOCKETS_TOTAL     global socket cap (default 4096)
 package udpext
 
 import (
@@ -76,9 +85,30 @@ const (
 // availability concern, not just self-harm. Both caps are overridable via
 // env (UDP_MAX_SOCKETS_PER_CELL / UDP_MAX_SOCKETS_TOTAL) for operators who
 // genuinely need more headroom.
+// The Peel relay opens ONE fixed inbound socket plus ONE ephemeral outbound
+// socket per active player session, so a single relay cell's live socket
+// count tracks its concurrent player count. The per-cell default is sized
+// for a busy relay (≈1k concurrent players) rather than the original 64,
+// which would have throttled the relay's normal session churn the moment the
+// bind regressions were lifted and it actually ran. Operators raise either
+// cap via env (UDP_MAX_SOCKETS_PER_CELL / UDP_MAX_SOCKETS_TOTAL).
 const (
-	defaultMaxSocketsPerCell = 64
-	defaultMaxSocketsTotal   = 512
+	defaultMaxSocketsPerCell = 1024
+	defaultMaxSocketsTotal   = 4096
+)
+
+// Default send/bind allowlists. These admit the Peel relay's legit data
+// plane out of the box (forward to RFC-1918/ULA game-server backends; bind a
+// public 0.0.0.0/:: inbound listener) while keeping the dangerous classes
+// (loopback / link-local / metadata / multicast for send) blocked. Setting
+// the corresponding env var replaces the default entirely.
+const (
+	// RFC-1918 (10/8, 172.16/12, 192.168/16) + ULA (fc00::/7). The relay
+	// forwards player traffic to these internal backends; loopback/metadata
+	// are deliberately NOT here and stay blocked by ipBlocked.
+	defaultSendAllow = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7"
+	// Wildcard binds the relay's public inbound listener resolves to.
+	defaultBindAllow = "0.0.0.0,::"
 )
 
 // ---------------------------------------------------------------------
@@ -102,8 +132,20 @@ const (
 // The guard reuses the http ext's ipBlocked predicate (loopback /
 // link-local / multicast / unspecified / RFC-1918 + ULA) and adds an
 // explicit allowlist (env-configured host[:port] or CIDR) for genuinely-
-// needed internal targets. Default is deny-all-private for SEND, and
-// loopback-only for BIND.
+// needed targets.
+//
+// Defaults are tuned for the canonical consumer — the Peel UDP relay, which
+// binds a public inbound port and forwards player traffic to private
+// (RFC-1918 Docker-internal) game-server backends:
+//   - SEND allowlist defaults to the RFC-1918 + ULA private ranges so the
+//     relay's forward-to-backend path works out of the box. The dangerous
+//     reflection/own-host targets (loopback, link-local/metadata, multicast,
+//     unspecified) remain blocked regardless. Operators who do not run a
+//     relay can set UDP_SEND_ALLOW explicitly to re-block private ranges.
+//   - BIND allowlist defaults to the wildcard binds (0.0.0.0 / ::) the relay
+//     needs for its public inbound listener. Operators can set UDP_BIND_ALLOW
+//     explicitly to restrict which interface a cell may bind a fixed port on.
+// Both defaults are overridden the moment the corresponding env var is set.
 
 var (
 	errBlockedDst  = errors.New("udp egress guard: destination IP is in a blocked (private/loopback/link-local/metadata/multicast) range")
@@ -200,17 +242,51 @@ func (g *egressGuard) checkSend(rawHost string, dst *net.UDPAddr) error {
 	return nil
 }
 
-// checkBind validates a resolved listen address. A loopback bind is always
-// permitted; an explicitly-allowlisted host/IP is permitted; everything
-// else (0.0.0.0, ::, a public/LAN interface) is refused unless allowlisted.
+// checkBind validates a resolved listen address.
+//
+// A port-0 (kernel-assigned, ephemeral) bind is ALWAYS permitted regardless
+// of IP: it is a transient client socket, not a fixed public service. The
+// kernel picks the port and nothing on the network can address it as a
+// stable listener, so it carries none of the all-interface-exposure risk
+// that the bind guard exists to stop. This is the standard way to open an
+// outbound UDP socket (e.g. the Peel relay's per-player ephemeral outbound
+// sockets, opened via udp.Listen("")).
+//
+// For a FIXED-port bind, a loopback address is always permitted; an
+// explicitly-allowlisted host/IP is permitted; everything else (0.0.0.0,
+// ::, a public/LAN interface) is refused unless allowlisted via
+// UDP_BIND_ALLOW. A relay that is MEANT to be reachable (the Peel inbound
+// listener on :5520) is admitted because UDP_BIND_ALLOW defaults to the
+// wildcard binds the relay needs (see newUDPManager / defaultBindAllow).
 func (g *egressGuard) checkBind(rawHost string, addr *net.UDPAddr) error {
+	if addr.Port == 0 {
+		return nil
+	}
 	if addr.IP.IsLoopback() {
 		return nil
 	}
 	if g.hostAllowed(rawHost) || g.ipAllowed(addr.IP) {
 		return nil
 	}
-	return fmt.Errorf("%w: %s", errBlockedBind, addr.IP.String())
+	// A nil or unspecified IP on a FIXED port is a wildcard "all interfaces"
+	// bind — net.ResolveUDPAddr yields IP=<nil> for the ":port" short form
+	// (the Peel relay's configured listen_addr) and IP=0.0.0.0 / :: for the
+	// explicit forms. The first form has an empty rawHost that no allowlist
+	// entry matches, so authorize it via the canonical wildcard tokens
+	// ("0.0.0.0" / "::") that UDP_BIND_ALLOW carries by default. This is what
+	// lets a relay that is MEANT to be reachable bind its public listener,
+	// while a cell binding a concrete non-loopback interface still needs that
+	// exact host/CIDR allowlisted.
+	if addr.IP == nil || addr.IP.IsUnspecified() {
+		if g.hostAllowed("0.0.0.0") || g.hostAllowed("::") {
+			return nil
+		}
+	}
+	ipStr := "<nil>"
+	if addr.IP != nil {
+		ipStr = addr.IP.String()
+	}
+	return fmt.Errorf("%w: %s", errBlockedBind, ipStr)
 }
 
 // ---------------------------------------------------------------------
@@ -364,13 +440,25 @@ type udpManager struct {
 func newUDPManager(logger *slog.Logger) *udpManager {
 	return &udpManager{
 		logger:     logger,
-		sendGuard:  newEgressGuard(os.Getenv("UDP_SEND_ALLOW")),
-		bindGuard:  newEgressGuard(os.Getenv("UDP_BIND_ALLOW")),
+		sendGuard:  newEgressGuard(envOr("UDP_SEND_ALLOW", defaultSendAllow)),
+		bindGuard:  newEgressGuard(envOr("UDP_BIND_ALLOW", defaultBindAllow)),
 		maxPerCell: envInt("UDP_MAX_SOCKETS_PER_CELL", defaultMaxSocketsPerCell),
 		maxTotal:   envInt("UDP_MAX_SOCKETS_TOTAL", defaultMaxSocketsTotal),
 		sockets:    map[uint64]*udpSocket{},
 		perCell:    map[string]int{},
 	}
+}
+
+// envOr returns the trimmed value of env key, or def when it is unset/blank.
+// Used so the send/bind allowlists default to the relay's working values
+// while staying fully overridable (including to "" via an explicit empty,
+// non-whitespace-stripped-to-empty set — operators tighten by listing only
+// what they need).
+func envOr(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return def
 }
 
 // envInt reads a positive integer from env, falling back to def when unset,

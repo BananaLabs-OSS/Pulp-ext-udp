@@ -9,7 +9,8 @@ import (
 
 // newTestManager builds a manager with explicit guards/caps, bypassing the
 // env-derived ones. Empty allow strings yield deny-all-private (send) and
-// loopback-only (bind) guards so the block paths can be exercised.
+// deny-wildcard (bind) guards so the block paths can be exercised. Tests that
+// want the production defaults pass defaultSendAllow / defaultBindAllow.
 func newTestManager(sendAllow, bindAllow string, perCell, total int) *udpManager {
 	return &udpManager{
 		logger:     slog.Default(),
@@ -96,17 +97,85 @@ func TestSend_AllowlistPermitsInternal(t *testing.T) {
 	}
 }
 
-// TestListen_BlocksWildcardBind confirms binding 0.0.0.0 / :: is refused by
-// default — the all-interface exposure class.
+// TestSend_DefaultsPermitPrivateBackendsButBlockOwnHost confirms the
+// production default send allowlist (defaultSendAllow) lets the Peel relay
+// forward to RFC-1918 game-server backends, while loopback / link-local
+// metadata / multicast destinations stay blocked (the reflection / own-host
+// class the guard exists to stop).
+func TestSend_DefaultsPermitPrivateBackendsButBlockOwnHost(t *testing.T) {
+	m := newTestManager(defaultSendAllow, defaultBindAllow, 64, 512)
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer conn.Close()
+	m.sockets[1] = &udpSocket{id: 1, cellID: "c1", conn: conn}
+
+	// RFC-1918 backends (the relay's real forward targets) must pass the
+	// guard. The OS may still fail the actual WriteToUDP if the private
+	// network is unreachable from the test host — that is a "write udp:"
+	// error, NOT an egress block. We assert only that the guard admitted the
+	// destination (no "blocked" error).
+	for _, dst := range []string{"10.99.0.10:5520", "172.16.0.1:5521", "192.168.1.50:5520"} {
+		_, err := m.send("c1", udpSendRequest{SocketID: 1, DstAddr: dst, Payload: []byte("x")})
+		if err != nil && strings.Contains(err.Error(), "blocked") {
+			t.Errorf("send to private backend %q should pass guard under defaults, got blocked: %v", dst, err)
+		}
+	}
+	// Own-host / reflection class stays blocked even under defaults.
+	for _, dst := range []string{"127.0.0.1:9", "169.254.169.254:80", "224.0.0.1:9"} {
+		_, err := m.send("c1", udpSendRequest{SocketID: 1, DstAddr: dst, Payload: []byte("x")})
+		if err == nil || !strings.Contains(err.Error(), "blocked") {
+			t.Errorf("send to %q: expected egress block under defaults, got %v", dst, err)
+		}
+	}
+}
+
+// TestListen_BlocksWildcardBind confirms binding a FIXED public/wildcard port
+// is refused when the bind allowlist is empty — the all-interface exposure
+// class. Fixed ports (not :0) are used because a kernel-assigned ephemeral
+// (port-0) bind is a transient client socket and is always permitted.
 func TestListen_BlocksWildcardBind(t *testing.T) {
 	m := newTestManager("", "", 64, 512)
-	for _, addr := range []string{"0.0.0.0:0", ":0", "[::]:0"} {
+	for _, addr := range []string{"0.0.0.0:5520", ":5520", "[::]:5520"} {
 		_, err := m.listen("c1", udpListenRequest{Addr: addr})
 		if err == nil {
 			t.Errorf("bind %q: expected bind block, got nil", addr)
-		} else if !strings.Contains(err.Error(), "loopback") {
+		} else if !strings.Contains(err.Error(), "bind guard") {
 			t.Errorf("bind %q: expected bind-guard error, got %v", addr, err)
 		}
+	}
+}
+
+// TestListen_PermitsEphemeralBind confirms a port-0 (kernel-assigned
+// ephemeral) bind is always allowed regardless of IP, even with an empty
+// allowlist. This is the Peel relay's per-player outbound-socket path
+// (udp.Listen("")), and a resolver's :0 probe socket — transient client
+// sockets, not exposed listeners.
+func TestListen_PermitsEphemeralBind(t *testing.T) {
+	m := newTestManager("", "", 64, 512)
+	for _, addr := range []string{"", ":0", "0.0.0.0:0", "[::]:0"} {
+		id, err := m.listen("c1", udpListenRequest{Addr: addr})
+		if err != nil {
+			t.Fatalf("ephemeral bind %q should succeed, got %v", addr, err)
+		}
+		_ = m.close("c1", udpCloseRequest{SocketID: id})
+	}
+}
+
+// TestListen_PeelInboundBindWithDefaults confirms the Peel relay's configured
+// public inbound listener (":5520", the production listen_addr → nil-IP
+// fixed-port wildcard bind) is admitted under the production default bind
+// allowlist. This is the regression the fix restores: a relay MEANT to be
+// reachable must be able to bind its player-facing port.
+func TestListen_PeelInboundBindWithDefaults(t *testing.T) {
+	m := newTestManager(defaultSendAllow, defaultBindAllow, 64, 512)
+	for _, addr := range []string{":5520", "0.0.0.0:5520", "[::]:5520"} {
+		id, err := m.listen("c1", udpListenRequest{Addr: addr})
+		if err != nil {
+			t.Fatalf("relay inbound bind %q should succeed under defaults, got %v", addr, err)
+		}
+		_ = m.close("c1", udpCloseRequest{SocketID: id})
 	}
 }
 
@@ -122,11 +191,12 @@ func TestListen_PermitsLoopbackBind(t *testing.T) {
 	}
 }
 
-// TestListen_BindAllowlist confirms UDP_BIND_ALLOW lets a wildcard bind
-// through when explicitly permitted.
+// TestListen_BindAllowlist confirms UDP_BIND_ALLOW lets a FIXED-port wildcard
+// bind through when explicitly permitted (a fixed port, so the always-allow
+// ephemeral path is not what is being exercised).
 func TestListen_BindAllowlist(t *testing.T) {
 	m := newTestManager("", "0.0.0.0", 64, 512)
-	id, err := m.listen("c1", udpListenRequest{Addr: "0.0.0.0:0"})
+	id, err := m.listen("c1", udpListenRequest{Addr: "0.0.0.0:5520"})
 	if err != nil {
 		t.Fatalf("allowlisted wildcard bind should succeed, got %v", err)
 	}
