@@ -17,13 +17,36 @@
 //	udp_listen(req, resp)  — bind a UDP socket, return monotonic socket_id
 //	udp_send(req, resp)    — send a datagram on a socket
 //	udp_close(req)         — close a socket and stop its reader
+//
+// Security posture (all cell-supplied addresses are end-user-influenced):
+//
+//	udp_send  is default-deny-private — destinations in loopback /
+//	          link-local / metadata / RFC-1918 / ULA / multicast ranges are
+//	          refused (return code 12) so a cell cannot reach internal
+//	          services or use the host as a reflection/amplification source.
+//	udp_listen is default loopback-only — binding 0.0.0.0 / :: / a public
+//	          interface is refused (return code 12) so a cell cannot expose
+//	          an inbound listener on every interface.
+//	Both    are capped per-cell and globally on concurrent sockets to bound
+//	        host FD / memory / goroutine growth (return code 4 over the cap).
+//
+// Env configuration:
+//
+//	UDP_SEND_ALLOW            comma-separated host[:port] / CIDR send exemptions
+//	UDP_BIND_ALLOW            comma-separated host[:port] / CIDR bind exemptions
+//	UDP_MAX_SOCKETS_PER_CELL  per-cell socket cap (default 64)
+//	UDP_MAX_SOCKETS_TOTAL     global socket cap (default 512)
 package udpext
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,18 +70,161 @@ const (
 	maxDatagramSize   = 65535
 )
 
+// Resource-exhaustion caps. A buggy or hostile cell could otherwise loop
+// on udp_listen and exhaust host-process file descriptors / memory /
+// goroutines — FDs are a PROCESS-GLOBAL resource, so this is a cross-cell
+// availability concern, not just self-harm. Both caps are overridable via
+// env (UDP_MAX_SOCKETS_PER_CELL / UDP_MAX_SOCKETS_TOTAL) for operators who
+// genuinely need more headroom.
+const (
+	defaultMaxSocketsPerCell = 64
+	defaultMaxSocketsTotal   = 512
+)
+
+// ---------------------------------------------------------------------
+// Egress / bind policy — mirrors Pulp-ext-http's egressGuard.
+// ---------------------------------------------------------------------
+//
+// A cell holding network.udp supplies BOTH the destination of udp_send and
+// the bind address of udp_listen as fully cell-controlled strings, and the
+// cell's inputs originate from end users (Evolution forwards customer data).
+// Without a guard a cell could:
+//   - udp_send to 127.0.0.1 / ::1 (loopback services on the VPS),
+//     169.254.169.254 (link-local / cloud-metadata-adjacent), RFC-1918 / ULA
+//     (internal services, Postgres/Docker control plane, sidecars), or fire
+//     spoof-payload datagrams at public amplifiers (DNS/NTP/memcached) using
+//     the VPS as a reflection/amplification source. UDP is connectionless, so
+//     there is no handshake bottleneck — default-deny is the right posture.
+//   - udp_listen on 0.0.0.0 / :: exposing an inbound listener on EVERY
+//     interface (public internet / VPC peers / other tenants), turning the
+//     ext into an unsolicited-input / exfil channel.
+//
+// The guard reuses the http ext's ipBlocked predicate (loopback /
+// link-local / multicast / unspecified / RFC-1918 + ULA) and adds an
+// explicit allowlist (env-configured host[:port] or CIDR) for genuinely-
+// needed internal targets. Default is deny-all-private for SEND, and
+// loopback-only for BIND.
+
+var (
+	errBlockedDst  = errors.New("udp egress guard: destination IP is in a blocked (private/loopback/link-local/metadata/multicast) range")
+	errBlockedBind = errors.New("udp bind guard: bind address must be loopback (or explicitly allowlisted) — refusing to expose listener on all interfaces")
+)
+
+// ipBlocked reports whether ip falls in a range a cell must not reach.
+// Covers loopback, link-local (incl. 169.254.169.254 cloud metadata),
+// RFC-1918 / ULA private, unspecified, and multicast/broadcast — the
+// latter matters more for UDP than HTTP (no handshake, trivial fan-out).
+// Lifted from Pulp-ext-http/http.go to keep one egress predicate.
+func ipBlocked(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() ||
+		ip.IsMulticast() ||
+		ip.IsUnspecified() ||
+		ip.IsPrivate() { // RFC-1918 + ULA (fc00::/7)
+		return true
+	}
+	return false
+}
+
+// egressGuard decides whether a udp_send destination or udp_listen bind may
+// proceed. Constructed once at Setup from env. allowHosts holds explicit
+// host[:port] exemptions; allowNets holds CIDR exemptions. Empty guard =
+// deny-all-private for send, loopback-only for bind.
+type egressGuard struct {
+	allowHosts map[string]struct{}
+	allowNets  []*net.IPNet
+}
+
+// newEgressGuard parses a comma-separated allowlist (host, host:port, or
+// CIDR). Whitespace / empty / malformed entries are skipped. Mirrors the
+// http ext parser.
+func newEgressGuard(allowList string) *egressGuard {
+	g := &egressGuard{allowHosts: map[string]struct{}{}}
+	for _, raw := range strings.Split(allowList, ",") {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		if strings.Contains(entry, "/") {
+			if _, ipnet, err := net.ParseCIDR(entry); err == nil {
+				g.allowNets = append(g.allowNets, ipnet)
+			}
+			continue
+		}
+		g.allowHosts[strings.ToLower(entry)] = struct{}{}
+	}
+	return g
+}
+
+// hostAllowed reports whether host (host or host:port) is on the explicit
+// allowlist and therefore exempt from the IP block.
+func (g *egressGuard) hostAllowed(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if _, ok := g.allowHosts[host]; ok {
+		return true
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		if _, ok := g.allowHosts[h]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// ipAllowed reports whether ip is inside one of the allowlisted CIDRs.
+func (g *egressGuard) ipAllowed(ip net.IP) bool {
+	for _, n := range g.allowNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkSend validates a resolved send destination. rawHost is the original
+// cell-supplied host[:port] string (so a by-name allowlist entry still
+// matches even though we resolved it to an IP). Returns nil if the
+// destination is permitted.
+func (g *egressGuard) checkSend(rawHost string, dst *net.UDPAddr) error {
+	if g.hostAllowed(rawHost) || g.ipAllowed(dst.IP) {
+		return nil
+	}
+	if ipBlocked(dst.IP) {
+		return fmt.Errorf("%w: %s", errBlockedDst, dst.IP.String())
+	}
+	return nil
+}
+
+// checkBind validates a resolved listen address. A loopback bind is always
+// permitted; an explicitly-allowlisted host/IP is permitted; everything
+// else (0.0.0.0, ::, a public/LAN interface) is refused unless allowlisted.
+func (g *egressGuard) checkBind(rawHost string, addr *net.UDPAddr) error {
+	if addr.IP.IsLoopback() {
+		return nil
+	}
+	if g.hostAllowed(rawHost) || g.ipAllowed(addr.IP) {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", errBlockedBind, addr.IP.String())
+}
+
 // ---------------------------------------------------------------------
 // init — register the network.udp capability
 // ---------------------------------------------------------------------
 
 func init() {
 	ext.Register(ext.Capability{
-		Name:           "network.udp",
-		Register:       udpRegister,
-		Stub:           udpStub,
-		Setup:          udpSetup,
-		Teardown:       udpTeardown,
-		Poll:           udpPoll,
+		Name:         "network.udp",
+		Register:     udpRegister,
+		Stub:         udpStub,
+		Setup:        udpSetup,
+		Teardown:     udpTeardown,
+		Poll:         udpPoll,
 		TeardownCell: udpTeardownCell,
 	})
 }
@@ -161,12 +327,12 @@ func (r *packetRing) droppedCount() uint64 {
 // ---------------------------------------------------------------------
 
 type udpSocket struct {
-	id       uint64
+	id     uint64
 	cellID string
-	conn     *net.UDPConn
-	addr     string
-	ring     *packetRing
-	cancel   context.CancelFunc
+	conn   *net.UDPConn
+	addr   string
+	ring   *packetRing
+	cancel context.CancelFunc
 }
 
 // ---------------------------------------------------------------------
@@ -176,18 +342,46 @@ type udpSocket struct {
 type udpManager struct {
 	logger *slog.Logger
 
+	// sendGuard gates udp_send destinations (deny-all-private + allowlist).
+	// bindGuard gates udp_listen bind addresses (loopback-only + allowlist).
+	sendGuard *egressGuard
+	bindGuard *egressGuard
+
+	// maxPerCell / maxTotal cap concurrent sockets to bound FD / memory /
+	// goroutine growth. perCell tracks live socket counts by owning cell.
+	maxPerCell int
+	maxTotal   int
+
 	mu      sync.Mutex
 	sockets map[uint64]*udpSocket
-	order   []uint64 // stable iteration order for Poll round-robin
+	perCell map[string]int // cellID → live (reserved) socket count
+	total   int            // sum of reserved slots across all cells
+	order   []uint64       // stable iteration order for Poll round-robin
 	nextID  atomic.Uint64
 	pollIdx int // rotating start index for Poll fairness
 }
 
 func newUDPManager(logger *slog.Logger) *udpManager {
 	return &udpManager{
-		logger:  logger,
-		sockets: map[uint64]*udpSocket{},
+		logger:     logger,
+		sendGuard:  newEgressGuard(os.Getenv("UDP_SEND_ALLOW")),
+		bindGuard:  newEgressGuard(os.Getenv("UDP_BIND_ALLOW")),
+		maxPerCell: envInt("UDP_MAX_SOCKETS_PER_CELL", defaultMaxSocketsPerCell),
+		maxTotal:   envInt("UDP_MAX_SOCKETS_TOTAL", defaultMaxSocketsTotal),
+		sockets:    map[uint64]*udpSocket{},
+		perCell:    map[string]int{},
 	}
+}
+
+// envInt reads a positive integer from env, falling back to def when unset,
+// empty, non-numeric, or <= 0.
+func envInt(key string, def int) int {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
 }
 
 var manager *udpManager
@@ -201,13 +395,30 @@ func (m *udpManager) listen(cellID string, req udpListenRequest) (uint64, error)
 	if err != nil {
 		return 0, fmt.Errorf("resolve %q: %w", req.Addr, err)
 	}
+	// Bind-exposure guard: refuse 0.0.0.0 / :: / public-interface binds so a
+	// cell cannot expose an inbound listener on every interface. Loopback is
+	// always allowed; other addresses require an explicit UDP_BIND_ALLOW
+	// entry. Resolve happens before the bind so no FD is opened on rejection.
+	if err := m.bindGuard.checkBind(hostOf(req.Addr), udpAddr); err != nil {
+		return 0, err
+	}
+
+	// Resource-exhaustion cap: reserve a slot under the lock BEFORE opening
+	// the FD so a tight udp_listen loop is rejected without ever allocating.
+	if err := m.reserveSlot(cellID); err != nil {
+		return 0, err
+	}
+
 	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
+		m.releaseSlot(cellID)
 		return 0, fmt.Errorf("listen %q: %w", req.Addr, err)
 	}
 
+	// Clamp the cell-controlled read buffer so a cell cannot request an
+	// outsized SetReadBuffer to amplify host memory pressure.
 	bufSize := req.BufferSize
-	if bufSize <= 0 {
+	if bufSize <= 0 || bufSize > defaultReadBuffer {
 		bufSize = defaultReadBuffer
 	}
 	if err := conn.SetReadBuffer(bufSize); err != nil {
@@ -217,12 +428,12 @@ func (m *udpManager) listen(cellID string, req udpListenRequest) (uint64, error)
 	id := m.nextID.Add(1)
 	ctx, cancel := context.WithCancel(context.Background())
 	sock := &udpSocket{
-		id:       id,
+		id:     id,
 		cellID: cellID,
-		conn:     conn,
-		addr:     req.Addr,
-		ring:     newPacketRing(defaultRingSize),
-		cancel:   cancel,
+		conn:   conn,
+		addr:   req.Addr,
+		ring:   newPacketRing(defaultRingSize),
+		cancel: cancel,
 	}
 
 	m.mu.Lock()
@@ -234,6 +445,54 @@ func (m *udpManager) listen(cellID string, req udpListenRequest) (uint64, error)
 
 	m.logger.Info("udp socket listening", "id", id, "cell", cellID, "addr", req.Addr, "buffer_size", bufSize)
 	return id, nil
+}
+
+// hostOf returns the host portion of a "host:port" bind/dest string, or the
+// string itself when it has no port. Used to feed the by-name allowlist.
+func hostOf(addr string) string {
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		return h
+	}
+	return addr
+}
+
+// reserveSlot increments the per-cell and global socket counters if both
+// caps allow, returning an error otherwise. Must be paired with
+// releaseSlot on any failure AFTER reservation (e.g. a failed bind) and on
+// socket close. The reservation is held under m.mu so concurrent
+// udp_listen calls cannot race past the cap.
+func (m *udpManager) reserveSlot(cellID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.total >= m.maxTotal {
+		return fmt.Errorf("udp socket cap reached: %d global sockets in use", m.maxTotal)
+	}
+	if m.perCell[cellID] >= m.maxPerCell {
+		return fmt.Errorf("udp socket cap reached: cell %q already owns %d sockets", cellID, m.maxPerCell)
+	}
+	m.perCell[cellID]++
+	m.total++
+	return nil
+}
+
+// releaseSlot decrements the per-cell counter, clearing the map entry at
+// zero to keep it bounded. Caller must hold no lock.
+func (m *udpManager) releaseSlot(cellID string) {
+	m.mu.Lock()
+	m.releaseSlotLocked(cellID)
+	m.mu.Unlock()
+}
+
+// releaseSlotLocked is releaseSlot for callers already holding m.mu.
+func (m *udpManager) releaseSlotLocked(cellID string) {
+	if n := m.perCell[cellID]; n > 1 {
+		m.perCell[cellID] = n - 1
+	} else {
+		delete(m.perCell, cellID)
+	}
+	if m.total > 0 {
+		m.total--
+	}
 }
 
 // ErrNotYourSocket is returned when a cell tries to send or close a
@@ -255,6 +514,15 @@ func (m *udpManager) send(cellID string, req udpSendRequest) (int, error) {
 	dst, err := net.ResolveUDPAddr("udp", req.DstAddr)
 	if err != nil {
 		return 0, fmt.Errorf("resolve dst %q: %w", req.DstAddr, err)
+	}
+	// Egress guard: refuse loopback / link-local / metadata / RFC-1918 / ULA
+	// / multicast destinations so a cell cannot reach internal services or
+	// abuse the host as a UDP reflection/amplification source. The resolved
+	// IP is checked (not the hostname string), so a name that resolves to a
+	// blocked range is still refused. Explicit destinations can be permitted
+	// via UDP_SEND_ALLOW.
+	if err := m.sendGuard.checkSend(hostOf(req.DstAddr), dst); err != nil {
+		return 0, err
 	}
 	n, err := sock.conn.WriteToUDP(req.Payload, dst)
 	if err != nil {
@@ -282,6 +550,7 @@ func (m *udpManager) close(cellID string, req udpCloseRequest) error {
 			break
 		}
 	}
+	m.releaseSlotLocked(sock.cellID)
 	m.mu.Unlock()
 
 	sock.cancel()
@@ -307,6 +576,7 @@ func (m *udpManager) closeCell(cellID string) int {
 		if s.cellID == cellID {
 			victims = append(victims, s)
 			delete(m.sockets, id)
+			m.releaseSlotLocked(cellID)
 		}
 	}
 	// Rebuild order without victim IDs.
@@ -408,9 +678,9 @@ func (m *udpManager) poll() (ext.StepEvent, bool) {
 		m.mu.Unlock()
 
 		return ext.StepEvent{
-			Kind:     EventUDPPacket,
-			Payload:  payload,
-			CellID: sock.cellID,
+			Kind:    EventUDPPacket,
+			Payload: payload,
+			CellID:  sock.cellID,
 		}, true
 	}
 	return ext.StepEvent{}, false
@@ -424,6 +694,8 @@ func (m *udpManager) shutdown() {
 		socks = append(socks, s)
 	}
 	m.sockets = map[uint64]*udpSocket{}
+	m.perCell = map[string]int{}
+	m.total = 0
 	m.order = nil
 	m.mu.Unlock()
 
@@ -503,6 +775,10 @@ func udpRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			}
 			id, err := manager.listen(cellID, req)
 			if err != nil {
+				if errors.Is(err, errBlockedBind) {
+					manager.logger.Warn("udp_listen bind blocked", "err", err, "cell", cellID, "addr", req.Addr)
+					return 12
+				}
 				manager.logger.Error("udp_listen failed", "err", err, "cell", cellID, "addr", req.Addr)
 				return 4
 			}
@@ -531,6 +807,10 @@ func udpRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 				if err == ErrNotYourSocket {
 					manager.logger.Warn("udp_send cross-cell rejected", "cell", cellID, "socket_id", req.SocketID)
 					return 11
+				}
+				if errors.Is(err, errBlockedDst) {
+					manager.logger.Warn("udp_send egress blocked", "err", err, "cell", cellID, "socket_id", req.SocketID, "dst", req.DstAddr)
+					return 12
 				}
 				manager.logger.Error("udp_send failed", "err", err, "cell", cellID, "socket_id", req.SocketID, "dst", req.DstAddr)
 				return 4
