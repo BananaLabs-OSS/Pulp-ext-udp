@@ -112,7 +112,7 @@ const (
 )
 
 // ---------------------------------------------------------------------
-// Egress / bind policy — mirrors Pulp-ext-http's egressGuard.
+// Egress / bind policy — parallel to Pulp/ssrfguard (HTTP guard).
 // ---------------------------------------------------------------------
 //
 // A cell holding network.udp supplies BOTH the destination of udp_send and
@@ -129,10 +129,10 @@ const (
 //     interface (public internet / VPC peers / other tenants), turning the
 //     ext into an unsolicited-input / exfil channel.
 //
-// The guard reuses the http ext's ipBlocked predicate (loopback /
-// link-local / multicast / unspecified / RFC-1918 + ULA) and adds an
-// explicit allowlist (env-configured host[:port] or CIDR) for genuinely-
-// needed targets.
+// The IP-block predicate (ipBlocked) mirrors ssrfguard.IPBlocked. The guard
+// types (egressGuard) are kept local because UDP's checkBind logic (ephemeral
+// port-0 always allowed; wildcard-fixed-port needs explicit allowlist) has no
+// equivalent in the HTTP-centric ssrfguard package.
 //
 // Defaults are tuned for the canonical consumer — the Peel UDP relay, which
 // binds a public inbound port and forwards player traffic to private
@@ -156,7 +156,10 @@ var (
 // Covers loopback, link-local (incl. 169.254.169.254 cloud metadata),
 // RFC-1918 / ULA private, unspecified, and multicast/broadcast — the
 // latter matters more for UDP than HTTP (no handshake, trivial fan-out).
-// Lifted from Pulp-ext-http/http.go to keep one egress predicate.
+// Mirrors ssrfguard.IPBlocked in github.com/BananaLabs-OSS/Pulp/ssrfguard;
+// kept local because the UDP guard layer is not HTTP-centric (no dial hooks,
+// no redirect chain) and checkBind is UDP-specific with no ssrfguard
+// equivalent. If ssrfguard.IPBlocked ever diverges, reconcile here.
 func ipBlocked(ip net.IP) bool {
 	if ip == nil {
 		return true
