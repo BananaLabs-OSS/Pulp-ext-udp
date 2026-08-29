@@ -25,3 +25,9 @@ go.work.sum
 .idea/
 .projx/
 audit/
+# Local agent tooling
+/.claude/
+/.codegraph/
+/.codex/
+/.mcp.json
+/CLAUDE.md
