@@ -1,6 +1,6 @@
 module github.com/BananaLabs-OSS/Pulp-ext-udp
 
-go 1.25.6
+go 1.25.13
 
 require (
 	github.com/BananaLabs-OSS/Pulp v0.2.0
