@@ -11,5 +11,5 @@ permissions:
 
 jobs:
   test:
-    uses: BananaLabs-OSS/.github/.github/workflows/go-ci.yml@12b697bf98006d1f9163c30571accbdc32495265
+    uses: BananaLabs-OSS/.github/.github/workflows/go-ci.yml@bdc81a8a0f751c60140d9d1505c56853475cc85f
 
